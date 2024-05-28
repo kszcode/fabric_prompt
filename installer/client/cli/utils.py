@@ -1,6 +1,6 @@
 import requests
 import os
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError
 import asyncio
 import pyperclip
 import sys
@@ -8,8 +8,9 @@ import platform
 from dotenv import load_dotenv
 import zipfile
 import tempfile
-import re
+import subprocess
 import shutil
+from youtube_transcript_api import YouTubeTranscriptApi
 
 current_directory = os.path.dirname(os.path.realpath(__file__))
 config_directory = os.path.expanduser("~/.config/fabric")
@@ -34,65 +35,159 @@ class Standalone:
         """
 
         # Expand the tilde to the full path
+        if args is None:
+            args = type('Args', (), {})()
         env_file = os.path.expanduser(env_file)
+        self.client = None
         load_dotenv(env_file)
-        try:
-            apikey = os.environ["OPENAI_API_KEY"]
-            self.client = OpenAI()
-            self.client.api_key = apikey
-        except FileNotFoundError:
-            print("No API key found. Use the --apikey option to set the key")
-            sys.exit()
+        if "OPENAI_API_KEY" in os.environ:
+            api_key = os.environ['OPENAI_API_KEY']
+            self.client = OpenAI(api_key=api_key)
         self.local = False
         self.config_pattern_directory = config_directory
         self.pattern = pattern
         self.args = args
-        self.model = args.model
+        self.model = getattr(args, 'model', None)
+        if not self.model:
+            self.model = os.environ.get('DEFAULT_MODEL', None)
+            if not self.model:
+                self.model = 'gpt-4-turbo-preview'
         self.claude = False
-        sorted_gpt_models, ollamaList, claudeList = self.fetch_available_models()
-        self.local = self.model.strip() in ollamaList
-        self.claude = self.model.strip() in claudeList
+        sorted_gpt_models, ollamaList, claudeList, googleList = self.fetch_available_models()
+        self.sorted_gpt_models = sorted_gpt_models
+        self.ollamaList = ollamaList
+        self.claudeList = claudeList
+        self.googleList = googleList
+        self.local = self.model in ollamaList
+        self.claude = self.model in claudeList
+        self.google = self.model in googleList
 
-    async def localChat(self, messages):
+    async def localChat(self, messages, host=''):
         from ollama import AsyncClient
-        response = await AsyncClient().chat(model=self.model, messages=messages)
+        response = None
+        if host:
+            response = await AsyncClient(host=host).chat(model=self.model, messages=messages)
+        else:
+            response = await AsyncClient().chat(model=self.model, messages=messages)
         print(response['message']['content'])
+        copy = self.args.copy
+        if copy:
+            pyperclip.copy(response['message']['content'])
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(response['message']['content'])
 
-    async def localStream(self, messages):
+    async def localStream(self, messages, host=''):
         from ollama import AsyncClient
-        async for part in await AsyncClient().chat(model=self.model, messages=messages, stream=True):
-            print(part['message']['content'], end='', flush=True)
+        buffer = ""
+        if host:
+            async for part in await AsyncClient(host=host).chat(model=self.model, messages=messages, stream=True):
+                buffer += part['message']['content']
+                print(part['message']['content'], end='', flush=True)
+        else:
+            async for part in await AsyncClient().chat(model=self.model, messages=messages, stream=True):
+                buffer += part['message']['content']
+                print(part['message']['content'], end='', flush=True)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(buffer)
+        if self.args.copy:
+            pyperclip.copy(buffer)
 
     async def claudeStream(self, system, user):
         from anthropic import AsyncAnthropic
         self.claudeApiKey = os.environ["CLAUDE_API_KEY"]
         Streamingclient = AsyncAnthropic(api_key=self.claudeApiKey)
+        buffer = ""
         async with Streamingclient.messages.stream(
             max_tokens=4096,
             system=system,
             messages=[user],
-            model=self.model, temperature=0.0, top_p=1.0
+            model=self.model, temperature=self.args.temp, top_p=self.args.top_p
         ) as stream:
             async for text in stream.text_stream:
+                buffer += text
                 print(text, end="", flush=True)
             print()
-
+        if self.args.copy:
+            pyperclip.copy(buffer)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(buffer)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, buffer, self.args.session)
         message = await stream.get_final_message()
 
-    async def claudeChat(self, system, user):
+    async def claudeChat(self, system, user, copy=False):
         from anthropic import Anthropic
         self.claudeApiKey = os.environ["CLAUDE_API_KEY"]
         client = Anthropic(api_key=self.claudeApiKey)
+        message = None
         message = client.messages.create(
             max_tokens=4096,
             system=system,
             messages=[user],
             model=self.model,
-            temperature=0.0, top_p=1.0
+            temperature=self.args.temp, top_p=self.args.top_p
         )
         print(message.content[0].text)
+        copy = self.args.copy
+        if copy:
+            pyperclip.copy(message.content[0].text)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(message.content[0].text)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, message.content[0].text, self.args.session)
 
-    def streamMessage(self, input_data: str, context=""):
+    async def googleChat(self, system, user, copy=False):
+        import google.generativeai as genai
+        self.googleApiKey = os.environ["GOOGLE_API_KEY"]
+        genai.configure(api_key=self.googleApiKey)
+        model = genai.GenerativeModel(
+            model_name=self.model, system_instruction=system)
+        response = model.generate_content(user)
+        print(response.text)
+        if copy:
+            pyperclip.copy(response.text)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(response.text)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, response.text, self.args.session)
+
+    async def googleStream(self, system, user, copy=False):
+        import google.generativeai as genai
+        buffer = ""
+        self.googleApiKey = os.environ["GOOGLE_API_KEY"]
+        genai.configure(api_key=self.googleApiKey)
+        model = genai.GenerativeModel(
+            model_name=self.model, system_instruction=system)
+        response = model.generate_content(user, stream=True)
+        for chunk in response:
+            buffer += chunk.text
+            print(chunk.text)
+        if copy:
+            pyperclip.copy(buffer)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(buffer)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, buffer, self.args.session)
+
+    def streamMessage(self, input_data: str, context="", host=''):
         """        Stream a message and handle exceptions.
 
         Args:
@@ -108,23 +203,41 @@ class Standalone:
         wisdomFilePath = os.path.join(
             config_directory, f"patterns/{self.pattern}/system.md"
         )
+        session_message = ""
+        user = ""
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session_message = session.read_from_session(
+                self.args.session)
+        if session_message:
+            user = session_message + '\n' + input_data
+        else:
+            user = input_data
         user_message = {"role": "user", "content": f"{input_data}"}
-        wisdom_File = os.path.join(current_directory, wisdomFilePath)
-        system = ""
+        wisdom_File = wisdomFilePath
         buffer = ""
+        system = ""
         if self.pattern:
             try:
                 with open(wisdom_File, "r") as f:
                     if context:
                         system = context + '\n\n' + f.read()
+                        if session_message:
+                            system = session_message + '\n' + system
                     else:
                         system = f.read()
+                        if session_message:
+                            system = session_message + '\n' + system
                     system_message = {"role": "system", "content": system}
                 messages = [system_message, user_message]
             except FileNotFoundError:
                 print("pattern not found")
                 return
         else:
+            if session_message:
+                user_message['content'] = session_message + \
+                    '\n' + user_message['content']
             if context:
                 messages = [
                     {"role": "system", "content": context}, user_message]
@@ -132,18 +245,25 @@ class Standalone:
                 messages = [user_message]
         try:
             if self.local:
-                asyncio.run(self.localStream(messages))
+                if host:
+                    asyncio.run(self.localStream(messages, host=host))
+                else:
+                    asyncio.run(self.localStream(messages))
             elif self.claude:
                 from anthropic import AsyncAnthropic
                 asyncio.run(self.claudeStream(system, user_message))
+            elif self.google:
+                if system == "":
+                    system = " "
+                asyncio.run(self.googleStream(system, user_message['content']))
             else:
                 stream = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=0.0,
-                    top_p=1,
-                    frequency_penalty=0.1,
-                    presence_penalty=0.1,
+                    temperature=self.args.temp,
+                    top_p=self.args.top_p,
+                    frequency_penalty=self.args.frequency_penalty,
+                    presence_penalty=self.args.presence_penalty,
                     stream=True,
                 )
                 for chunk in stream:
@@ -175,8 +295,13 @@ class Standalone:
         if self.args.output:
             with open(self.args.output, "w") as f:
                 f.write(buffer)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, buffer, self.args.session)
 
-    def sendMessage(self, input_data: str, context=""):
+    def sendMessage(self, input_data: str, context="", host=''):
         """        Send a message using the input data and generate a response.
 
         Args:
@@ -192,22 +317,38 @@ class Standalone:
         wisdomFilePath = os.path.join(
             config_directory, f"patterns/{self.pattern}/system.md"
         )
+        user = input_data
         user_message = {"role": "user", "content": f"{input_data}"}
         wisdom_File = os.path.join(current_directory, wisdomFilePath)
         system = ""
+        session_message = ""
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session_message = session.read_from_session(
+                self.args.session)
         if self.pattern:
             try:
                 with open(wisdom_File, "r") as f:
                     if context:
-                        system = context + '\n\n' + f.read()
+                        if session_message:
+                            system = session_message + '\n' + context + '\n\n' + f.read()
+                        else:
+                            system = context + '\n\n' + f.read()
                     else:
-                        system = f.read()
+                        if session_message:
+                            system = session_message + '\n' + f.read()
+                        else:
+                            system = f.read()
                     system_message = {"role": "system", "content": system}
                 messages = [system_message, user_message]
             except FileNotFoundError:
                 print("pattern not found")
                 return
         else:
+            if session_message:
+                user_message['content'] = session_message + \
+                    '\n' + user_message['content']
             if context:
                 messages = [
                     {'role': 'system', 'content': context}, user_message]
@@ -215,19 +356,36 @@ class Standalone:
                 messages = [user_message]
         try:
             if self.local:
-                asyncio.run(self.localChat(messages))
+                if host:
+                    asyncio.run(self.localChat(messages, host=host))
+                else:
+                    asyncio.run(self.localChat(messages))
             elif self.claude:
                 asyncio.run(self.claudeChat(system, user_message))
+            elif self.google:
+                if system == "":
+                    system = " "
+                asyncio.run(self.googleChat(system, user_message['content']))
             else:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=0.0,
-                    top_p=1,
-                    frequency_penalty=0.1,
-                    presence_penalty=0.1,
+                    temperature=self.args.temp,
+                    top_p=self.args.top_p,
+                    frequency_penalty=self.args.frequency_penalty,
+                    presence_penalty=self.args.presence_penalty,
                 )
                 print(response.choices[0].message.content)
+                if self.args.copy:
+                    pyperclip.copy(response.choices[0].message.content)
+                if self.args.output:
+                    with open(self.args.output, "w") as f:
+                        f.write(response.choices[0].message.content)
+                if self.args.session:
+                    from .helper import Session
+                    session = Session()
+                    session.save_to_session(
+                        system, user, response.choices[0], self.args.session)
         except Exception as e:
             if "All connection attempts failed" in str(e):
                 print(
@@ -243,45 +401,56 @@ class Standalone:
             else:
                 print(f"Error: {e}")
                 print(e)
-        if self.args.copy:
-            pyperclip.copy(response.choices[0].message.content)
-        if self.args.output:
-            with open(self.args.output, "w") as f:
-                f.write(response.choices[0].message.content)
 
     def fetch_available_models(self):
         gptlist = []
         fullOllamaList = []
-        claudeList = ['claude-3-opus-20240229']
-        headers = {
-            "Authorization": f"Bearer {self.client.api_key}"
-        }
-
-        response = requests.get(
-            "https://api.openai.com/v1/models", headers=headers)
-
-        if response.status_code == 200:
-            models = response.json().get("data", [])
-            # Filter only gpt models
-            gpt_models = [model for model in models if model.get(
-                "id", "").startswith(("gpt"))]
-            # Sort the models alphabetically by their ID
-            sorted_gpt_models = sorted(
-                gpt_models, key=lambda x: x.get("id"))
-
-            for model in sorted_gpt_models:
-                gptlist.append(model.get("id"))
+        googleList = []
+        if "CLAUDE_API_KEY" in os.environ:
+            claudeList = ['claude-3-opus-20240229', 'claude-3-sonnet-20240229',
+                          'claude-3-haiku-20240307', 'claude-2.1']
         else:
-            print(f"Failed to fetch models: HTTP {response.status_code}")
+            claudeList = []
+
+        try:
+            if self.client:
+                models = [model.id.strip()
+                          for model in self.client.models.list().data]
+                if "/" in models[0] or "\\" in models[0]:
+                    gptlist = [item[item.rfind(
+                        "/") + 1:] if "/" in item else item[item.rfind("\\") + 1:] for item in models]
+                else:
+                    gptlist = [item.strip()
+                               for item in models if item.startswith("gpt")]
+                gptlist.sort()
+        except APIConnectionError as e:
+            pass
+        except Exception as e:
+            print(f"Error: {getattr(e.__context__, 'args', [''])[0]}")
             sys.exit()
+
         import ollama
         try:
-            default_modelollamaList = ollama.list()['models']
+            remoteOllamaServer = getattr(self.args, 'remoteOllamaServer', None)
+            if remoteOllamaServer:
+                client = ollama.Client(host=self.args.remoteOllamaServer)
+                default_modelollamaList = client.list()['models']
+            else:
+                default_modelollamaList = ollama.list()['models']
             for model in default_modelollamaList:
-                fullOllamaList.append(model['name'].rstrip(":latest"))
+                fullOllamaList.append(model['name'])
         except:
             fullOllamaList = []
-        return gptlist, fullOllamaList, claudeList
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    googleList.append(m.name)
+        except:
+            googleList = []
+
+        return gptlist, fullOllamaList, claudeList, googleList
 
     def get_cli_input(self):
         """ aided by ChatGPT; uses platform library
@@ -302,6 +471,23 @@ class Standalone:
                 return input("Enter Question: ")
         else:
             return sys.stdin.read()
+
+    def agents(self, userInput):
+        from praisonai import PraisonAI
+        model = self.model
+        os.environ["OPENAI_MODEL_NAME"] = model
+        if model in self.sorted_gpt_models:
+            os.environ["OPENAI_API_BASE"] = "https://api.openai.com/v1/"
+        elif model in self.ollamaList:
+            os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
+            os.environ["OPENAI_API_KEY"] = "NA"
+
+        elif model in self.claudeList:
+            print("Claude is not supported in this mode")
+            sys.exit()
+        print("Starting PraisonAI...")
+        praison_ai = PraisonAI(auto=userInput, framework="autogen")
+        praison_ai.main()
 
 
 class Update:
@@ -327,6 +513,17 @@ class Update:
             if os.path.exists(patterns_source_path):
                 # If the patterns directory already exists, remove it before copying over the new one
                 if os.path.exists(self.pattern_directory):
+                    old_pattern_contents = os.listdir(self.pattern_directory)
+                    new_pattern_contents = os.listdir(patterns_source_path)
+                    custom_patterns = []
+                    for pattern in old_pattern_contents:
+                        if pattern not in new_pattern_contents:
+                            custom_patterns.append(pattern)
+                    if custom_patterns:
+                        for pattern in custom_patterns:
+                            custom_path = os.path.join(
+                                self.pattern_directory, pattern)
+                            shutil.move(custom_path, patterns_source_path)
                     shutil.rmtree(self.pattern_directory)
                 shutil.copytree(patterns_source_path, self.pattern_directory)
                 print("Patterns updated successfully.")
@@ -352,57 +549,15 @@ class Update:
 class Alias:
     def __init__(self):
         self.config_files = []
-        home_directory = os.path.expanduser("~")
-        self.patterns = os.path.join(home_directory, ".config/fabric/patterns")
-        if os.path.exists(os.path.join(home_directory, ".bashrc")):
-            self.config_files.append(os.path.join(home_directory, ".bashrc"))
-        if os.path.exists(os.path.join(home_directory, ".zshrc")):
-            self.config_files.append(os.path.join(home_directory, ".zshrc"))
-        if os.path.exists(os.path.join(home_directory, ".bash_profile")):
-            self.config_files.append(os.path.join(
-                home_directory, ".bash_profile"))
-        self.remove_all_patterns()
-        self.add_patterns()
-        print('Aliases added successfully. Please restart your terminal to use them.')
+        self.home_directory = os.path.expanduser("~")
+        patternsFolder = os.path.join(
+            self.home_directory, ".config/fabric/patterns")
+        self.patterns = os.listdir(patternsFolder)
 
-    def add(self, name, alias):
-        for file in self.config_files:
-            with open(file, "a") as f:
-                f.write(f"alias {name}='{alias}'\n")
-
-    def remove(self, pattern):
-        for file in self.config_files:
-            # Read the whole file first
-            with open(file, "r") as f:
-                wholeFile = f.read()
-
-            # Determine if the line to be removed is in the file
-            target_line = f"alias {pattern}='fabric --pattern {pattern}'\n"
-            if target_line in wholeFile:
-                # If the line exists, replace it with nothing (remove it)
-                wholeFile = wholeFile.replace(target_line, "")
-
-                # Write the modified content back to the file
-                with open(file, "w") as f:
-                    f.write(wholeFile)
-
-    def remove_all_patterns(self):
-        allPatterns = os.listdir(self.patterns)
-        for pattern in allPatterns:
-            self.remove(pattern)
-
-    def find_line(self, name):
-        for file in self.config_files:
-            with open(file, "r") as f:
-                lines = f.readlines()
-            for line in lines:
-                if line.strip("\n") == f"alias ${name}='{alias}'":
-                    return line
-
-    def add_patterns(self):
-        allPatterns = os.listdir(self.patterns)
-        for pattern in allPatterns:
-            self.add(pattern, f"fabric --pattern {pattern}")
+    def execute(self):
+        with open(os.path.join(self.home_directory, ".config/fabric/fabric-bootstrap.inc"), "w") as w:
+            for pattern in self.patterns:
+                w.write(f"alias {pattern}='fabric --pattern {pattern}'\n")
 
 
 class Setup:
@@ -417,9 +572,18 @@ class Setup:
         self.pattern_directory = os.path.join(
             self.config_directory, "patterns")
         os.makedirs(self.pattern_directory, exist_ok=True)
+        self.shconfigs = []
+        home = os.path.expanduser("~")
+        if os.path.exists(os.path.join(home, ".bashrc")):
+            self.shconfigs.append(os.path.join(home, ".bashrc"))
+        if os.path.exists(os.path.join(home, ".bash_profile")):
+            self.shconfigs.append(os.path.join(home, ".bash_profile"))
+        if os.path.exists(os.path.join(home, ".zshrc")):
+            self.shconfigs.append(os.path.join(home, ".zshrc"))
         self.env_file = os.path.join(self.config_directory, ".env")
         self.gptlist = []
         self.fullOllamaList = []
+        self.googleList = []
         self.claudeList = ['claude-3-opus-20240229']
         load_dotenv(self.env_file)
         try:
@@ -427,42 +591,35 @@ class Setup:
             self.openaiapi_key = openaiapikey
         except:
             pass
-        try:
-            self.fetch_available_models()
-        except:
-            pass
 
-    def fetch_available_models(self):
-        headers = {
-            "Authorization": f"Bearer {self.openaiapi_key}"
-        }
+    def __ensure_env_file_created(self):
+        """        Ensure that the environment file is created.
 
-        response = requests.get(
-            "https://api.openai.com/v1/models", headers=headers)
+        Returns:
+            None
 
-        if response.status_code == 200:
-            models = response.json().get("data", [])
-            # Filter only gpt models
-            gpt_models = [model for model in models if model.get(
-                "id", "").startswith(("gpt"))]
-            # Sort the models alphabetically by their ID
-            sorted_gpt_models = sorted(
-                gpt_models, key=lambda x: x.get("id"))
+        Raises:
+            OSError: If the environment file cannot be created.
+        """
+        print("Creating empty environment file...")
+        if not os.path.exists(self.env_file):
+            with open(self.env_file, "w") as f:
+                f.write("#No API key set\n")
+        print("Environment file created.")
 
-            for model in sorted_gpt_models:
-                self.gptlist.append(model.get("id"))
-        else:
-            print(f"Failed to fetch models: HTTP {response.status_code}")
-            sys.exit()
-        import ollama
-        try:
-            default_modelollamaList = ollama.list()['models']
-            for model in default_modelollamaList:
-                self.fullOllamaList.append(model['name'].rstrip(":latest"))
-        except:
-            self.fullOllamaList = []
-        allmodels = self.gptlist + self.fullOllamaList + self.claudeList
-        return allmodels
+    def update_shconfigs(self):
+        bootstrap_file = os.path.join(
+            self.config_directory, "fabric-bootstrap.inc")
+        sourceLine = f'if [ -f "{bootstrap_file}" ]; then . "{bootstrap_file}"; fi'
+        for config in self.shconfigs:
+            lines = None
+            with open(config, 'r') as f:
+                lines = f.readlines()
+            with open(config, 'w') as f:
+                for line in lines:
+                    if sourceLine not in line:
+                        f.write(line)
+                f.write(sourceLine)
 
     def api_key(self, api_key):
         """        Set the OpenAI API key in the environment file.
@@ -479,7 +636,7 @@ class Setup:
         api_key = api_key.strip()
         if not os.path.exists(self.env_file) and api_key:
             with open(self.env_file, "w") as f:
-                f.write(f"OPENAI_API_KEY={api_key}")
+                f.write(f"OPENAI_API_KEY={api_key}\n")
             print(f"OpenAI API key set to {api_key}")
         elif api_key:
             # erase the line OPENAI_API_KEY=key and write the new key
@@ -489,7 +646,7 @@ class Setup:
                 for line in lines:
                     if "OPENAI_API_KEY" not in line:
                         f.write(line)
-                f.write(f"OPENAI_API_KEY={api_key}")
+                f.write(f"OPENAI_API_KEY={api_key}\n")
 
     def claude_key(self, claude_key):
         """        Set the Claude API key in the environment file.
@@ -511,101 +668,60 @@ class Setup:
                 for line in lines:
                     if "CLAUDE_API_KEY" not in line:
                         f.write(line)
-                f.write(f"CLAUDE_API_KEY={claude_key}")
+                f.write(f"CLAUDE_API_KEY={claude_key}\n")
         elif claude_key:
             with open(self.env_file, "w") as f:
-                f.write(f"CLAUDE_API_KEY={claude_key}")
+                f.write(f"CLAUDE_API_KEY={claude_key}\n")
 
-    def update_fabric_command(self, line, model):
-        fabric_command_regex = re.compile(
-            r"(alias.*fabric --pattern\s+\S+.*?)( --model.*)?'")
-        match = fabric_command_regex.search(line)
-        if match:
-            base_command = match.group(1)
-            # Provide a default value for current_flag
-            current_flag = match.group(2) if match.group(2) else ""
-            new_flag = ""
-            new_flag = f" --model {model}"
-            # Update the command if the new flag is different or to remove an existing flag.
-            # Ensure to add the closing quote that was part of the original regex
-            return f"{base_command}{new_flag}'\n"
-        else:
-            return line  # Return the line unmodified if no match is found.
+    def google_key(self, google_key):
+        """        Set the Google API key in the environment file.
 
-    def update_fabric_alias(self, line, model):
-        fabric_alias_regex = re.compile(
-            r"(alias fabric='[^']+?)( --model.*)?'")
-        match = fabric_alias_regex.search(line)
-        if match:
-            base_command, current_flag = match.groups()
-            new_flag = f" --model {model}"
-            # Update the alias if the new flag is different or to remove an existing flag.
-            return f"{base_command}{new_flag}'\n"
-        else:
-            return line  # Return the line unmodified if no match is found.
-
-    def clear_alias(self, line):
-        fabric_command_regex = re.compile(
-            r"(alias fabric='[^']+?)( --model.*)?'")
-        match = fabric_command_regex.search(line)
-        if match:
-            base_command = match.group(1)
-            return f"{base_command}'\n"
-        else:
-            return line  # Return the line unmodified if no match is found.
-
-    def clear_env_line(self, line):
-        fabric_command_regex = re.compile(
-            r"(alias.*fabric --pattern\s+\S+.*?)( --model.*)?'")
-        match = fabric_command_regex.search(line)
-        if match:
-            base_command = match.group(1)
-            return f"{base_command}'\n"
-        else:
-            return line  # Return the line unmodified if no match is found.
-
-    def pattern(self, line):
-        fabric_command_regex = re.compile(
-            r"(alias fabric='[^']+?)( --model.*)?'")
-        match = fabric_command_regex.search(line)
-        if match:
-            base_command = match.group(1)
-            return f"{base_command}'\n"
-        else:
-            return line  # Return the line unmodified if no match is found.
-
-    def clean_env(self):
-        """Clear the DEFAULT_MODEL from the environment file.
+        Args:
+            google_key (str): The API key to be set.
 
         Returns:
             None
+
+        Raises:
+            OSError: If the environment file does not exist or cannot be accessed.
         """
-        user_home = os.path.expanduser("~")
-        sh_config = None
-        # Check for shell configuration files
-        if os.path.exists(os.path.join(user_home, ".bashrc")):
-            sh_config = os.path.join(user_home, ".bashrc")
-        elif os.path.exists(os.path.join(user_home, ".zshrc")):
-            sh_config = os.path.join(user_home, ".zshrc")
-        else:
-            print("No environment file found.")
-        if sh_config:
-            with open(sh_config, "r") as f:
+        google_key = google_key.strip()
+        if os.path.exists(self.env_file) and google_key:
+            with open(self.env_file, "r") as f:
                 lines = f.readlines()
-            with open(sh_config, "w") as f:
+            with open(self.env_file, "w") as f:
                 for line in lines:
-                    modified_line = line
-                    # Update existing fabric commands
-                    if "fabric --pattern" in line:
-                        modified_line = self.clear_env_line(
-                            modified_line)
-                    elif "fabric=" in line:
-                        modified_line = self.clear_alias(
-                            modified_line)
-                    f.write(modified_line)
-            self.remove_duplicates(env_file)
-        else:
-            print("No shell configuration file found.")
+                    if "GOOGLE_API_KEY" not in line:
+                        f.write(line)
+                f.write(f"GOOGLE_API_KEY={google_key}\n")
+        elif google_key:
+            with open(self.env_file, "w") as f:
+                f.write(f"GOOGLE_API_KEY={google_key}\n")
+
+    def youtube_key(self, youtube_key):
+        """        Set the YouTube API key in the environment file.
+
+        Args:
+            youtube_key (str): The API key to be set.
+
+        Returns:
+            None
+
+        Raises:
+            OSError: If the environment file does not exist or cannot be accessed.
+        """
+        youtube_key = youtube_key.strip()
+        if os.path.exists(self.env_file) and youtube_key:
+            with open(self.env_file, "r") as f:
+                lines = f.readlines()
+            with open(self.env_file, "w") as f:
+                for line in lines:
+                    if "YOUTUBE_API_KEY" not in line:
+                        f.write(line)
+                f.write(f"YOUTUBE_API_KEY={youtube_key}\n")
+        elif youtube_key:
+            with open(self.env_file, "w") as f:
+                f.write(f"YOUTUBE_API_KEY={youtube_key}\n")
 
     def default_model(self, model):
         """Set the default model in the environment file.
@@ -614,53 +730,43 @@ class Setup:
             model (str): The model to be set.
         """
         model = model.strip()
+        env = os.path.expanduser("~/.config/fabric/.env")
+        standalone = Standalone(args=[], pattern="")
+        gpt, ollama, claude, google = standalone.fetch_available_models()
+        allmodels = gpt + ollama + claude + google
+        if model not in allmodels:
+            print(
+                f"Error: {model} is not a valid model. Please run fabric --listmodels to see the available models.")
+            sys.exit()
+
+        # Only proceed if the model is not empty
         if model:
-            # Write or update the DEFAULT_MODEL in env_file
-            allModels = self.claudeList + self.fullOllamaList + self.gptlist
-            if model not in allModels:
+            if os.path.exists(env):
+                # Initialize a flag to track the presence of DEFAULT_MODEL
+                there = False
+                with open(env, "r") as f:
+                    lines = f.readlines()
+
+                # Open the file again to write the changes
+                with open(env, "w") as f:
+                    for line in lines:
+                        # Check each line to see if it contains DEFAULT_MODEL
+                        if "DEFAULT_MODEL=" in line:
+                            # Update the flag and the line with the new model
+                            there = True
+                            f.write(f'DEFAULT_MODEL={model}\n')
+                        else:
+                            # If the line does not contain DEFAULT_MODEL, write it unchanged
+                            f.write(line)
+
+                    # If DEFAULT_MODEL was not found in the file, add it
+                    if not there:
+                        f.write(f'DEFAULT_MODEL={model}\n')
+
                 print(
-                    f"Error: {model} is not a valid model. Please run fabric --listmodels to see the available models.")
-                sys.exit()
-
-        # Compile regular expressions outside of the loop for efficiency
-
-        user_home = os.path.expanduser("~")
-        sh_config = None
-        # Check for shell configuration files
-        if os.path.exists(os.path.join(user_home, ".bashrc")):
-            sh_config = os.path.join(user_home, ".bashrc")
-        elif os.path.exists(os.path.join(user_home, ".zshrc")):
-            sh_config = os.path.join(user_home, ".zshrc")
-
-        if sh_config:
-            with open(sh_config, "r") as f:
-                lines = f.readlines()
-            with open(sh_config, "w") as f:
-                for line in lines:
-                    modified_line = line
-                    # Update existing fabric commands
-                    if "fabric --pattern" in line:
-                        modified_line = self.update_fabric_command(
-                            modified_line, model)
-                    elif "fabric=" in line:
-                        modified_line = self.update_fabric_alias(
-                            modified_line, model)
-                    f.write(modified_line)
-            print(f"""Default model changed to {
-                  model}. Please restart your terminal to use it.""")
-        else:
-            print("No shell configuration file found.")
-
-    def remove_duplicates(self, filename):
-        unique_lines = set()
-        with open(filename, 'r') as file:
-            lines = file.readlines()
-
-        with open(filename, 'w') as file:
-            for line in lines:
-                if line not in unique_lines:
-                    file.write(line)
-                    unique_lines.add(line)
+                    f"Default model changed to {model}. Please restart your terminal to use it.")
+            else:
+                print("No shell configuration file found.")
 
     def patterns(self):
         """        Method to update patterns and exit the system.
@@ -683,11 +789,19 @@ class Setup:
         print("Welcome to Fabric. Let's get started.")
         apikey = input(
             "Please enter your OpenAI API key. If you do not have one or if you have already entered it, press enter.\n")
-        self.api_key(apikey.strip())
+        self.api_key(apikey)
         print("Please enter your claude API key. If you do not have one, or if you have already entered it, press enter.\n")
         claudekey = input()
-        self.claude_key(claudekey.strip())
+        self.claude_key(claudekey)
+        print("Please enter your Google API key. If you do not have one, or if you have already entered it, press enter.\n")
+        googlekey = input()
+        self.google_key(googlekey)
+        print("Please enter your YouTube API key. If you do not have one, or if you have already entered it, press enter.\n")
+        youtubekey = input()
+        self.youtube_key(youtubekey)
         self.patterns()
+        self.update_shconfigs()
+        self.__ensure_env_file_created()
 
 
 class Transcribe:
@@ -697,7 +811,7 @@ class Transcribe:
         of a YouTube video designated with the video_id
 
         Input:
-            the video id specifing a YouTube video
+            the video id specifying a YouTube video
             an example url for a video: https://www.youtube.com/watch?v=vF-MQmVxnCs&t=306s
             the video id is vF-MQmVxnCs&t=306s
 
@@ -729,8 +843,8 @@ class AgentSetup:
         """
 
         print("Welcome to Fabric. Let's get started.")
-        browserless = input("Please enter your Browserless API key\n")
-        serper = input("Please enter your Serper API key\n")
+        browserless = input("Please enter your Browserless API key\n").strip()
+        serper = input("Please enter your Serper API key\n").strip()
 
         # Entries to be added
         browserless_entry = f"BROWSERLESS_API_KEY={browserless}"
@@ -747,3 +861,37 @@ class AgentSetup:
             else:
                 # If it does not end with a newline, add one before the new entries
                 f.write(f"\n{browserless_entry}\n{serper_entry}\n")
+
+
+def run_electron_app():
+    # Step 1: Set CWD to the directory of the script
+    os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+    # Step 2: Check for the './installer/client/gui' directory
+    target_dir = '../gui'
+    if not os.path.exists(target_dir):
+        print(f"""The directory {
+              target_dir} does not exist. Please check the path and try again.""")
+        return
+
+    # Step 3: Check for NPM installation
+    try:
+        subprocess.run(['npm', '--version'], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print("NPM is not installed. Please install NPM and try again.")
+        return
+
+    # If this point is reached, NPM is installed.
+    # Step 4: Change directory to the Electron app's directory
+    os.chdir(target_dir)
+
+    # Step 5: Run 'npm install' and 'npm start'
+    try:
+        print("Running 'npm install'... This might take a few minutes.")
+        subprocess.run(['npm', 'install'], check=True)
+        print(
+            "'npm install' completed successfully. Starting the Electron app with 'npm start'...")
+        subprocess.run(['npm', 'start'], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while executing NPM commands: {e}")
